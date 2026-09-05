@@ -53,12 +53,22 @@ class EngineDefaults:
 MODEL_SERVER_URL = "http://127.0.0.1"
 MODEL_SERVER_PORT = 18000
 
-# Benchmark shape: start ~10k tokens, +~10k per turn, up to ~100k at depth 10.
+# Benchmark shape: start ~10k tokens, +~10k per turn.
 # 1 token ~= 4 chars. Each turn ~= 1 user chunk (~9.5k tok) + 1 short ack (~0.5k tok).
+#
+# STARTUP BUDGET: Vast's control plane marks a worker error if it is not ready
+# within ~300s of starting ("timed out starting after 300s" in workergroup logs).
+# That timeout is server-side (vast-ai autoscaler, types.cpp) — there is no 300s
+# constant anywhere in the pyworker SDK and no workergroup knob for it; model
+# load alone takes ~200s here, so the benchmark must finish in ~60-90s.
+# BENCH_DEPTHS therefore samples 10k->50k (5 payloads: 1 warmup + 2 runs x 2).
+# To cover the full curve to 100k once the budget allows, widen BENCH_DEPTHS
+# toward (1, 3, 5, 7, 10) or raise runs — but re-check the 300s budget first.
 NUM_TURNS = 10
+BENCH_DEPTHS = (1, 2, 3, 4, 5)
 USER_CHUNK_CHARS = 38000
 ASSISTANT_ACK_CHARS = 2000
-BENCHMARK_MAX_TOKENS = 256
+BENCHMARK_MAX_TOKENS = 128
 
 
 def _seeded_chunk_chars(seed: int, n_chars: int) -> str:
@@ -111,18 +121,21 @@ def chat_workload(data) -> float:
 
 
 class AgenticWorkflowGenerator:
-    """Growing multi-turn chain: depth d ~= d * 10k tokens, up to ~100k.
+    """Growing multi-turn chain: depth d ~= d * 10k tokens.
 
     - Turn chunks are prebuilt once with fixed seeds, so depth d always equals
       chunks[0..d] byte-identically. Concurrent benchmark requests at different
       depths still share exact prefixes -> vLLM prefix cache reuses KV blocks
       and only prefills the ~10k delta, matching prod (10k in, +10k/turn).
-    - Depths cycle round-robin 1..NUM_TURNS so one startup benchmark covers the
-      whole 10k->100k curve instead of a single point.
+    - Depths cycle through BENCH_DEPTHS so one startup benchmark covers a
+      representative slice of the 10k->100k curve instead of a single point.
+      Kept to 5 payloads (1 warmup + 2 runs x 2 concurrent) to fit Vast's
+      ~300s server-side starting budget (see constants above).
     - Thread-safe counter for concurrent payload generation.
     """
 
-    def __init__(self, num_turns: int = NUM_TURNS, max_tokens: int = BENCHMARK_MAX_TOKENS):
+    def __init__(self, depths=(1, 2, 3, 4, 5), num_turns: int = NUM_TURNS, max_tokens: int = BENCHMARK_MAX_TOKENS):
+        self.depths = tuple(depths)
         self.num_turns = num_turns
         self.max_tokens = max_tokens
         self.system_message = (
@@ -143,7 +156,7 @@ class AgenticWorkflowGenerator:
     def __call__(self) -> dict:
         model = _resolve_model_name_or_raise()
         with self._lock:
-            depth = (self._counter % self.num_turns) + 1
+            depth = self.depths[self._counter % len(self.depths)]
             self._counter += 1
         messages = [{"role": "system", "content": self.system_message}]
         for i in range(depth):
@@ -168,7 +181,7 @@ def run(defaults: EngineDefaults) -> None:
     alias = f" (BACKEND={backend})" if backend and backend != defaults.name else ""
     print(f"Using worker backend: {defaults.name}{alias}", flush=True)
 
-    agentic_workflow_generator = AgenticWorkflowGenerator()
+    agentic_workflow_generator = AgenticWorkflowGenerator(depths=BENCH_DEPTHS)
 
     # Relative path resolves against the server url+port; a full URL is used as-is.
     healthcheck_url = os.environ.get("MODEL_HEALTH_ENDPOINT", "/health")
