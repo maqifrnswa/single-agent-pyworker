@@ -229,6 +229,6 @@ if __name__ == "__main__":
         name="vllm",
         model_log_file="/var/log/portal/vllm.log",
         load_log_msgs=["Application startup complete."],
-        #error_log_msgs=["INFO exited: vllm", "RuntimeError: Engine", "Traceback (most recent call last):"],
-        error_log_msgs=["INFO exited: vllm", "Traceback (most recent call last):"],
+        error_log_msgs=["INFO exited: vllm", "RuntimeError: Engine", "Traceback (most recent call last):"],
+        #error_log_msgs=["INFO exited: vllm", "Traceback (most recent call last):"],
     ))
