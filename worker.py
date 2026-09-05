@@ -7,10 +7,10 @@ engine/version-specific values (log path, health endpoint, log grammar)."""
 
 import os
 import random
+import string
+import threading
 from dataclasses import dataclass, field
 from typing import List
-
-import nltk
 
 from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
@@ -30,6 +30,15 @@ def _resolve_model_name():
     return next((v for var in _MODEL_NAME_VARS if (v := os.environ.get(var))), None)
 
 
+def _resolve_model_name_or_raise():
+    model = _resolve_model_name()
+    if not model:
+        raise ValueError(
+            "No model set: MODEL_NAME / VLLM_MODEL / SGLANG_MODEL / LLAMA_MODEL all empty"
+        )
+    return model
+
+
 @dataclass(frozen=True)
 class EngineDefaults:
     """Per-engine baked defaults; each is overridden by the matching env var if set."""
@@ -44,49 +53,112 @@ class EngineDefaults:
 MODEL_SERVER_URL = "http://127.0.0.1"
 MODEL_SERVER_PORT = 18000
 
-# nltk.download("words")
-# WORD_LIST = nltk.corpus.words.words()
+# Benchmark shape: start ~10k tokens, +~10k per turn, up to ~100k at depth 10.
+# 1 token ~= 4 chars. Each turn ~= 1 user chunk (~9.5k tok) + 1 short ack (~0.5k tok).
+NUM_TURNS = 10
+USER_CHUNK_CHARS = 38000
+ASSISTANT_ACK_CHARS = 2000
+BENCHMARK_MAX_TOKENS = 256
+
+
+def _seeded_chunk_chars(seed: int, n_chars: int) -> str:
+    """Deterministic diverse filler: same seed always yields the same string.
+
+    Uses a seeded RNG so every worker (and every benchmark call) reproduces
+    identical prefixes. Prefix-cache hits require byte-identical token prefixes,
+    so determinism is load-bearing. Deliberately varied (not `"..." * N`) so
+    prefill cost resembles real diverse context.
+    """
+    rng = random.Random(seed)
+    alphabet = string.ascii_lowercase + string.digits
+    out = []
+    remaining = n_chars
+    while remaining > 0:
+        word_len = rng.randint(3, 10)
+        word = "".join(rng.choice(alphabet) for _ in range(word_len))
+        out.append(word)
+        remaining -= word_len + 1  # +1 for the space
+    return " ".join(out)[:n_chars]
 
 
 def request_parser(request):
     return request["input"] if request.get("input") is not None else request
 
 
-# def completions_benchmark_generator() -> dict:
-#     model = _resolve_model_name()
-#     if not model:
-#         raise ValueError("No model set: MODEL_NAME / VLLM_MODEL / SGLANG_MODEL / LLAMA_MODEL all empty")
-#     prompt = " ".join(random.choices(WORD_LIST, k=250))
-#     return {"model": model, "prompt": prompt, "temperature": 0.7, "max_tokens": 500}
+def chat_workload(data) -> float:
+    """Total input + output tokens (char/4 estimate), the Vast-recommended LLM cost proxy."""
+    try:
+        total_chars = 0
+        messages = data.get("messages", [])
+        if isinstance(messages, list):
+            for m in messages:
+                if isinstance(m, dict):
+                    content = m.get("content", "")
+                    if isinstance(content, str):
+                        total_chars += len(content)
+                    elif isinstance(content, list):
+                        # OpenAI structured content parts: [{type, text}, ...]
+                        for part in content:
+                            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                total_chars += len(part["text"])
+        # Fall back for /v1/completions-style payloads sharing this calculator.
+        prompt = data.get("prompt", "")
+        if isinstance(prompt, str):
+            total_chars += len(prompt)
+        return float(data.get("max_tokens", 0) + total_chars / 4.0)
+    except Exception:
+        return float(data.get("max_tokens", 0))
+
 
 class AgenticWorkflowGenerator:
-    def __init__(self):
-        self.model = _resolve_model_name()
-        # 1 token is approx 4 characters. 10,000 tokens ~= 40,000 characters.
-        base_text = "You are an autonomous AI agent tasked with multi-step reasoning. " * 600
-        
-        # We format this as a raw chat template
-        self.system_prefix = f"SYSTEM: {base_text}\n"
-        
-        # Simulate a ~500-token assistant response
-        self.simulated_response = "I have completed the sub-task. The results are as follows: " * 30
+    """Growing multi-turn chain: depth d ~= d * 10k tokens, up to ~100k.
 
-    def __call__(self):
-        turn_depth = random.randint(1, 5)
-        
-        # Start with the static 10k prefix to guarantee the base KV cache hit
-        prompt = self.system_prefix
-        
-        # Grow the context by appending simulated previous turns sequentially
-        for i in range(turn_depth):
-            prompt += f"USER: Execute agentic step {i+1}.\nASSISTANT: "
-            
-            # If it's not the final turn, append the assistant's previous output
-            if i < turn_depth - 1:
-                prompt += f"{self.simulated_response}\n"
-                
-        return {"model": self.model, "prompt": prompt, "temperature": 0.7, "max_tokens": 500}
-    
+    - Turn chunks are prebuilt once with fixed seeds, so depth d always equals
+      chunks[0..d] byte-identically. Concurrent benchmark requests at different
+      depths still share exact prefixes -> vLLM prefix cache reuses KV blocks
+      and only prefills the ~10k delta, matching prod (10k in, +10k/turn).
+    - Depths cycle round-robin 1..NUM_TURNS so one startup benchmark covers the
+      whole 10k->100k curve instead of a single point.
+    - Thread-safe counter for concurrent payload generation.
+    """
+
+    def __init__(self, num_turns: int = NUM_TURNS, max_tokens: int = BENCHMARK_MAX_TOKENS):
+        self.num_turns = num_turns
+        self.max_tokens = max_tokens
+        self.system_message = (
+            "You are an autonomous AI agent performing multi-step reasoning. "
+            "Use the conversation history to execute the next step."
+        )
+        self.user_chunks = [
+            f"Step {i + 1} context observations: {_seeded_chunk_chars(1000 + i, USER_CHUNK_CHARS)}"
+            for i in range(num_turns)
+        ]
+        self.assistant_acks = [
+            f"Step {i + 1} result: {_seeded_chunk_chars(2000 + i, ASSISTANT_ACK_CHARS)}"
+            for i in range(num_turns)
+        ]
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> dict:
+        model = _resolve_model_name_or_raise()
+        with self._lock:
+            depth = (self._counter % self.num_turns) + 1
+            self._counter += 1
+        messages = [{"role": "system", "content": self.system_message}]
+        for i in range(depth):
+            messages.append(
+                {"role": "user", "content": f"Execute agentic step {i + 1}.\n{self.user_chunks[i]}"}
+            )
+            if i < depth - 1:
+                messages.append({"role": "assistant", "content": self.assistant_acks[i]})
+        return {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": self.max_tokens,
+        }
+
 
 def run(defaults: EngineDefaults) -> None:
     """Build the WorkerConfig from defaults (env-overridable) and run the worker."""
@@ -109,20 +181,20 @@ def run(defaults: EngineDefaults) -> None:
         handlers=[
             HandlerConfig(
                 route="/v1/completions",
-                workload_calculator=lambda data: data.get("max_tokens", 0),
+                workload_calculator=lambda data: float(data.get("max_tokens", 0)),
+                allow_parallel_requests=True,
+                request_parser=request_parser,
+                max_queue_time=600.0
+                ),
+            HandlerConfig(
+                route="/v1/chat/completions",
+                workload_calculator=chat_workload,
                 allow_parallel_requests=True,
                 request_parser=request_parser,
                 max_queue_time=600.0,
                 benchmark_config=BenchmarkConfig(
-                    generator=agentic_workflow_generator, concurrency=3, runs=3
-                ),
-            ),
-            HandlerConfig(
-                route="/v1/chat/completions",
-                workload_calculator=lambda data: data.get("max_tokens", 0),
-                allow_parallel_requests=True,
-                request_parser=request_parser,
-                max_queue_time=600.0,
+                                    generator=agentic_workflow_generator, concurrency=2, runs=3
+                                ),
             ),
         ],
         log_action_config=LogActionConfig(
@@ -134,12 +206,11 @@ def run(defaults: EngineDefaults) -> None:
     Worker(WorkerConfig(**config)).run()
 
 
-
-
-# run it
-run(EngineDefaults(
-    name="vllm",
-    model_log_file="/var/log/portal/vllm.log",
-    load_log_msgs=["Application startup complete."],
-    error_log_msgs=["INFO exited: vllm", "RuntimeError: Engine", "Traceback (most recent call last):"],
-))
+if __name__ == "__main__":
+    # run it
+    run(EngineDefaults(
+        name="vllm",
+        model_log_file="/var/log/portal/vllm.log",
+        load_log_msgs=["Application startup complete."],
+        error_log_msgs=["INFO exited: vllm", "RuntimeError: Engine", "Traceback (most recent call last):"],
+    ))
