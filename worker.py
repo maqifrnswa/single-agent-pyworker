@@ -57,18 +57,21 @@ MODEL_SERVER_PORT = 18000
 # 1 token ~= 4 chars. Each turn ~= 1 user chunk (~9.5k tok) + 1 short ack (~0.5k tok).
 #
 # STARTUP BUDGET: Vast's control plane marks a worker error if it is not ready
-# within ~300s of starting ("timed out starting after 300s" in workergroup logs).
-# That timeout is server-side (vast-ai autoscaler, types.cpp) — there is no 300s
-# constant anywhere in the pyworker SDK and no workergroup knob for it; model
-# load alone takes ~200s here, so the benchmark must finish in ~60-90s.
-# BENCH_DEPTHS therefore samples 10k->50k (5 payloads: 1 warmup + 2 runs x 2).
+# within ~300s of starting ("timed out starting after 300s" in workergroup logs)
+# and ~1012s in loading ("timed out loading after ...s"). That timeout is
+# server-side (vast-ai autoscaler, types.cpp) — there is no timeout constant
+# anywhere in the pyworker SDK and no workergroup knob for it. Model load plus
+# benchmark runs ~9min on slow hosts, so keep the full benchmark under ~650s:
+# BENCH_DEPTHS samples 10k->50k (7 payloads: 1 warmup + 3 runs x 2 concurrent;
+# the last run is fully warm and sets max_perf) and BENCHMARK_MAX_TOKENS=512 matches typical prod
+# output length (250-500 tokens) with ignore_eos for deterministic decode load.
 # To cover the full curve to 100k once the budget allows, widen BENCH_DEPTHS
-# toward (1, 3, 5, 7, 10) or raise runs — but re-check the 300s budget first.
+# toward (1, 3, 5, 7, 10) — but re-check the timeout budget first.
 NUM_TURNS = 10
 BENCH_DEPTHS = (1, 2, 3, 4, 5)
 USER_CHUNK_CHARS = 38000
 ASSISTANT_ACK_CHARS = 2000
-BENCHMARK_MAX_TOKENS = 128
+BENCHMARK_MAX_TOKENS = 512
 
 
 def _seeded_chunk_chars(seed: int, n_chars: int) -> str:
@@ -170,6 +173,7 @@ class AgenticWorkflowGenerator:
             "messages": messages,
             "temperature": 0.7,
             "max_tokens": self.max_tokens,
+            "ignore_eos": True,
         }
 
 
