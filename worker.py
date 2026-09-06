@@ -130,7 +130,8 @@ def chat_workload(data) -> float:
         prompt = data.get("prompt", "")
         if isinstance(prompt, str):
             total_chars += len(prompt)
-        return float(data.get("max_tokens", 0) + total_chars / 4.0)
+        #return float(data.get("max_tokens", 0) + 0.25*total_chars / 4.0) # chars/4 = token estimate, 0.75 for cache hit
+        return float(500 + 0.25*total_chars / 4.0) # chars/4 = token estimate, 0.75 for cache hit; 500 output toks on average
     except Exception:
         return float(data.get("max_tokens", 0))
 
