@@ -83,8 +83,8 @@ NUM_TURNS = 10
 BENCH_DEPTHS = (4, 4, 4)
 USER_CHUNK_CHARS = 38000
 ASSISTANT_ACK_CHARS = 2000
-BENCHMARK_MAX_TOKENS = 512
-
+BENCHMARK_MAX_TOKENS = 512 # this must be typical, average for workload
+AVERAGE_OUTPUT_TOKENS = BENCHMARK_MAX_TOKENS # this is the average output tokens for workload
 
 def _seeded_chunk_chars(seed: int, n_chars: int) -> str:
     """Deterministic diverse filler: same seed always yields the same string.
@@ -131,7 +131,7 @@ def chat_workload(data) -> float:
         if isinstance(prompt, str):
             total_chars += len(prompt)
         #return float(data.get("max_tokens", 0) + 0.25*total_chars / 4.0) # chars/4 = token estimate, 0.75 for cache hit
-        return float(500 + 0.25*total_chars / 4.0) # chars/4 = token estimate, 0.75 for cache hit; 500 output toks on average
+        return float(AVERAGE_OUTPUT_TOKENS + 0.25*total_chars / 4.0) # chars/4 = token estimate, 0.75 for cache hit; 500 output toks on average
     except Exception:
         return float(data.get("max_tokens", 0))
 
