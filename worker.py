@@ -239,6 +239,12 @@ if __name__ == "__main__":
         name="vllm",
         model_log_file="/var/log/portal/vllm.log",
         load_log_msgs=["Application startup complete."],
-        error_log_msgs=["INFO exited: vllm", "RuntimeError: Engine", "Traceback (most recent call last):"],
-        #error_log_msgs=["INFO exited: vllm", "Traceback (most recent call last):"],
+        # Error patterns deliberately minimal: process death is the only
+        # load-bearing signal. Bare "Traceback" false-positives on benign
+        # torch inductor cubin-cache warnings (W0906, engine healthy), and
+        # "RuntimeError: Engine" fires on transient allocator OOMs the engine
+        # survives. All true fatals observed (EngineCore deaths) end with the
+        # supervisor reporting vllm EXITED, which "INFO exited: vllm" catches.
+        # Override per-template via MODEL_ERROR_LOG_MSGS (newline-delimited).
+        error_log_msgs=["INFO exited: vllm"],
     ))
