@@ -58,17 +58,22 @@ MODEL_SERVER_PORT = 18000
 #
 # STARTUP BUDGET: Vast's control plane marks a worker error if it is not ready
 # within ~300s of starting ("timed out starting after 300s" in workergroup logs)
-# and ~1012s in loading ("timed out loading after ...s"). That timeout is
-# server-side (vast-ai autoscaler, types.cpp) — there is no timeout constant
-# anywhere in the pyworker SDK and no workergroup knob for it. Model load plus
-# benchmark runs ~9min on slow hosts, so keep the full benchmark under ~650s:
-# BENCH_DEPTHS samples 10k->50k (7 payloads: 1 warmup + 3 runs x 2 concurrent;
-# the last run is fully warm and sets max_perf) and BENCHMARK_MAX_TOKENS=512 matches typical prod
-# output length (250-500 tokens) with ignore_eos for deterministic decode load.
-# To cover the full curve to 100k once the budget allows, widen BENCH_DEPTHS
-# toward (1, 3, 5, 7, 10) — but re-check the timeout budget first.
+# and ~800-1000s in loading ("timed out loading after ...s": 792s and 1012s
+# observed on different workers). That timeout is server-side (vast-ai
+# autoscaler, types.cpp) — there is no timeout constant anywhere in the
+# pyworker SDK and no workergroup knob for it.
+# BENCHMARK DESIGN (steady-state, not curve slice): the SDK runs exactly one
+# unmeasured warmup payload, then runs x concurrency measured payloads, and
+# reports the max. All payloads are full depth-10 (~100k tokens) with
+# byte-identical deterministic prefixes, so the single warmup pays the one cold
+# 100k prefill and every measured run is prefix-cache hits + 512-token decode:
+# the prod steady state (warm 100k context, 250-500 token outputs; ignore_eos
+# forces the full 512 for deterministic decode load). runs=2 is safe because no
+# measured run is cold. Slow hosts (~250 tok/s effective prefill) cannot warm
+# 100k inside the loading window and are expected to time out — they cannot
+# serve this workload, so failing loudly beats a misleading score.
 NUM_TURNS = 10
-BENCH_DEPTHS = (1, 2, 3, 4, 5)
+BENCH_DEPTHS = (10, 10, 10)
 USER_CHUNK_CHARS = 38000
 ASSISTANT_ACK_CHARS = 2000
 BENCHMARK_MAX_TOKENS = 512
@@ -127,13 +132,11 @@ class AgenticWorkflowGenerator:
     """Growing multi-turn chain: depth d ~= d * 10k tokens.
 
     - Turn chunks are prebuilt once with fixed seeds, so depth d always equals
-      chunks[0..d] byte-identically. Concurrent benchmark requests at different
-      depths still share exact prefixes -> vLLM prefix cache reuses KV blocks
-      and only prefills the ~10k delta, matching prod (10k in, +10k/turn).
-    - Depths cycle through BENCH_DEPTHS so one startup benchmark covers a
-      representative slice of the 10k->100k curve instead of a single point.
-      Kept to 5 payloads (1 warmup + 2 runs x 2 concurrent) to fit Vast's
-      ~300s server-side starting budget (see constants above).
+      chunks[0..d] byte-identically. Concurrent benchmark requests at the same
+      depth share exact prefixes -> vLLM prefix cache reuses KV blocks.
+    - Steady-state design: BENCH_DEPTHS is all depth-10 (~100k tokens), so the
+      single SDK warmup pays the one cold 100k prefill and every measured run
+      is prefix-cache hits + full decode — the prod steady state.
     - Thread-safe counter for concurrent payload generation.
     """
 
@@ -210,7 +213,7 @@ def run(defaults: EngineDefaults) -> None:
                 request_parser=request_parser,
                 max_queue_time=600.0,
                 benchmark_config=BenchmarkConfig(
-                                    generator=agentic_workflow_generator, concurrency=2, runs=3
+                                    generator=agentic_workflow_generator, concurrency=2, runs=2
                                 ),
             ),
         ],
