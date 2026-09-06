@@ -64,16 +64,23 @@ MODEL_SERVER_PORT = 18000
 # pyworker SDK and no workergroup knob for it.
 # BENCHMARK DESIGN (steady-state, not curve slice): the SDK runs exactly one
 # unmeasured warmup payload, then runs x concurrency measured payloads, and
-# reports the max. All payloads are full depth-10 (~100k tokens) with
-# byte-identical deterministic prefixes, so the single warmup pays the one cold
-# 100k prefill and every measured run is prefix-cache hits + 512-token decode:
-# the prod steady state (warm 100k context, 250-500 token outputs; ignore_eos
-# forces the full 512 for deterministic decode load). runs=2 is safe because no
-# measured run is cold. Slow hosts (~250 tok/s effective prefill) cannot warm
-# 100k inside the loading window and are expected to time out — they cannot
-# serve this workload, so failing loudly beats a misleading score.
+# reports the max. All payloads are full depth-4 with byte-identical
+# deterministic prefixes, so the single warmup pays the one cold prefill and
+# every measured run is prefix-cache hits + 512-token decode: the prod steady
+# state (warm ~100k-token context, 250-500 token outputs; ignore_eos forces
+# the full 512 for deterministic decode load). runs=2 is safe because no
+# measured run is cold.
+# TOKEN DENSITY WARNING: the seeded filler (random lower/digit words) tokenizes
+# at ~1.5 chars/token, not the ~4 of natural text — measured live 2026-09-06:
+# depth-10 (399k chars) tokenized to 261633 input tokens and overflowed the
+# 262144 limit by one token (400 BadRequestError). Depth-4 (~159k chars) is
+# ~105k engine tokens ~= prod 100k context. If the filler ever changes,
+# re-measure true token counts before trusting depth numbers. Slow hosts
+# (~250 tok/s effective prefill) may still time out warming 105k inside the
+# loading window; they cannot serve this workload, so failing loudly beats a
+# misleading score.
 NUM_TURNS = 10
-BENCH_DEPTHS = (10, 10, 10)
+BENCH_DEPTHS = (4, 4, 4)
 USER_CHUNK_CHARS = 38000
 ASSISTANT_ACK_CHARS = 2000
 BENCHMARK_MAX_TOKENS = 512
