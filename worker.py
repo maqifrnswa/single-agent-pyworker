@@ -246,5 +246,5 @@ if __name__ == "__main__":
         # survives. All true fatals observed (EngineCore deaths) end with the
         # supervisor reporting vllm EXITED, which "INFO exited: vllm" catches.
         # Override per-template via MODEL_ERROR_LOG_MSGS (newline-delimited).
-        error_log_msgs=["INFO exited: vllm"],
+        error_log_msgs=["INFO exited: vllm", "EngineCore failed to start"],
     ))
