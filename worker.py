@@ -239,7 +239,7 @@ if __name__ == "__main__":
     run(EngineDefaults(
         name="vllm",
         model_log_file="/var/log/portal/vllm.log",
-        load_log_msgs=["Application startup complete."],
+        load_log_msgs=["Application startup complete.", "engines connected"],
         # Error patterns deliberately minimal: process death is the only
         # load-bearing signal. Bare "Traceback" false-positives on benign
         # torch inductor cubin-cache warnings (W0906, engine healthy), and
