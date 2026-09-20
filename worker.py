@@ -5,6 +5,7 @@ here and the per-engine adapters just pass an EngineDefaults. Every default is
 env-overridable: the image is version-locked to the engine, so it owns the
 engine/version-specific values (log path, health endpoint, log grammar)."""
 
+import hashlib
 import os
 import random
 import string
@@ -53,41 +54,29 @@ class EngineDefaults:
 MODEL_SERVER_URL = "http://127.0.0.1"
 MODEL_SERVER_PORT = 18000
 
-# Benchmark shape: start ~10k tokens, +~10k per turn.
-# 1 token ~= 4 chars. Each turn ~= 1 user chunk (~9.5k tok) + 1 short ack (~0.5k tok).
-#
 # STARTUP BUDGET: Vast's control plane marks a worker error if it is not ready
 # within ~300s of starting ("timed out starting after 300s" in workergroup logs)
 # and ~800-1000s in loading ("timed out loading after ...s": 792s and 1012s
 # observed on different workers). That timeout is server-side (vast-ai
 # autoscaler, types.cpp) — there is no timeout constant anywhere in the
 # pyworker SDK and no workergroup knob for it.
-# BENCHMARK DESIGN (steady-state, not curve slice): the SDK runs exactly one
-# unmeasured warmup payload, then runs x concurrency measured payloads, and
-# reports the max. All payloads are full depth-4 with byte-identical
-# deterministic prefixes, so the single warmup pays the one cold prefill and
-# every measured run is prefix-cache hits + 512-token decode: the prod steady
-# state (warm ~100k-token context, 250-500 token outputs; ignore_eos forces
-# the full 512 for deterministic decode load). runs=2 is safe because no
-# measured run is cold.
-# TOKEN DENSITY WARNING: the seeded filler (random lower/digit words) tokenizes
-# at ~1.5 chars/token, not the ~4 of natural text — measured live 2026-09-06:
-# depth-10 (399k chars) tokenized to 261633 input tokens and overflowed the
-# 262144 limit by one token (400 BadRequestError). Depth-4 (~159k chars) is
-# ~105k engine tokens ~= prod 100k context. If the filler ever changes,
-# re-measure true token counts before trusting depth numbers. Slow hosts
-# (~250 tok/s effective prefill) may still time out warming 105k inside the
-# loading window; they cannot serve this workload, so failing loudly beats a
-# misleading score.
-NUM_TURNS = 10
-BENCH_DEPTHS = (4, 4, 4)
-USER_CHUNK_CHARS = 38000
-ASSISTANT_ACK_CHARS = 2000
-BENCHMARK_MAX_TOKENS = 512  # this must be typical, average for workload
+# BENCHMARK DESIGN (steady-state, not curve slice): every measured request is a
+# byte-identical shared prefix (a prefix-cache hit after the SDK's single
+# unmeasured warmup) plus a unique fresh tail (real prefill), and a forced full
+# decode (ignore_eos). The shape is IDENTICAL for every request and every run,
+# so the SDK's max-over-runs cannot select a warmer/faster/unrepresentative run.
+# Payloads are sized in REAL TOKENS via count_tokens(), and the benchmark's
+# forced decode length equals the calculator's charged output term, so charge
+# and measurement agree. runs=2 is safe because no measured run is cold.
+# TOKEN DENSITY NOTE: the seeded filler (random lower/digit words) tokenizes at
+# ~1.5 chars/token, not the ~4 of natural text; sizing goes through
+# count_tokens(), so this only affects byte length, not the token geometry.
+# Slow hosts (~250 tok/s effective prefill) may still time out warming the
+# prefix inside the loading window; they cannot serve this workload, so failing
+# loudly beats a misleading score.
 # Average output tokens charged per request. Measured on real opencode agentic
 # traffic (text+reasoning): mean ~471, median 166, p90 ~1457. Env-overridable.
-AVERAGE_OUTPUT_TOKENS = float(os.environ.get("WORKLOAD_AVG_OUTPUT_TOKENS",
-                                             str(BENCHMARK_MAX_TOKENS)))
+AVERAGE_OUTPUT_TOKENS = float(os.environ.get("WORKLOAD_AVG_OUTPUT_TOKENS", "512"))
 # Fraction of prompt tokens charged as uncached prefill. Real agentic traffic
 # measured ~86% prefix-cache hits (=> ~0.14 uncached); 0.25 is a conservative
 # upper bound. Env-overridable.
@@ -95,6 +84,18 @@ WORKLOAD_UNCACHED_FRACTION = float(os.environ.get("WORKLOAD_UNCACHED_FRACTION", 
 # Fallback chars-per-token when the tokenizer is unavailable (~4 natural text,
 # ~3.5 agentic code/JSON). Env-overridable.
 WORKLOAD_CHARS_PER_TOKEN = float(os.environ.get("WORKLOAD_CHARS_PER_TOKEN", "4.0"))
+
+# Benchmark geometry, in REAL TOKENS (production-shaped). Every measured request
+# is: byte-identical shared prefix (a prefix-cache hit) + a unique fresh tail
+# (real prefill), plus a forced full decode. Shape is identical for every
+# request and run, so max-over-runs cannot pick a warmer/faster run.
+BENCH_PREFIX_TOKENS = int(os.environ.get("BENCH_PREFIX_TOKENS", "61060"))  # shared, cached
+BENCH_TAIL_TOKENS = int(os.environ.get("BENCH_TAIL_TOKENS", "9940"))       # fresh, unique per request
+BENCH_MAX_MODEL_LEN = int(os.environ.get("BENCH_MAX_MODEL_LEN", "262144"))
+BENCH_PREFIX_SEED = int(os.environ.get("BENCH_PREFIX_SEED", "1000"))
+# The calculator's output term and the benchmark's forced decode length MUST be
+# the same number so charge and measurement agree.
+BENCHMARK_MAX_TOKENS = int(AVERAGE_OUTPUT_TOKENS)
 
 # Optional tool-call shape for benchmark payloads. The benchmark only measures
 # throughput, so the model need not actually call tools - but a real tool schema
@@ -136,6 +137,29 @@ def _seeded_chunk_chars(seed: int, n_chars: int) -> str:
         out.append(word)
         remaining -= word_len + 1  # +1 for the space
     return " ".join(out)[:n_chars]
+
+
+def _seeded_text_for_tokens(seed: int, target_tokens: int) -> str:
+    """Deterministic filler sized to ~target_tokens using count_tokens().
+
+    Bisects the character count so the SAME estimator used for the workload
+    charge also sizes the payload (consistent with or without a tokenizer).
+    """
+    target_tokens = max(1, int(target_tokens))
+    lo, hi = 1, max(64, target_tokens * 8)
+    best = _seeded_chunk_chars(seed, lo)
+    for _ in range(48):
+        mid = (lo + hi) // 2
+        text = _seeded_chunk_chars(seed, mid)
+        n = count_tokens(text)
+        best = text
+        if n < target_tokens:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+        if abs(n - target_tokens) <= max(2, 0.005 * target_tokens):
+            break
+    return best
 
 
 def request_parser(request):
@@ -221,51 +245,67 @@ def chat_workload(data) -> float:
 
 
 class AgenticWorkflowGenerator:
-    """Growing multi-turn chain: depth d ~= d * 10k tokens.
+    """Production-shaped benchmark payload: shared cached prefix + unique fresh tail.
 
-    - Turn chunks are prebuilt once with fixed seeds, so depth d always equals
-      chunks[0..d] byte-identically. Concurrent benchmark requests at the same
-      depth share exact prefixes -> vLLM prefix cache reuses KV blocks.
-    - Steady-state design: BENCH_DEPTHS is all depth-10 (~100k tokens), so the
-      single SDK warmup pays the one cold 100k prefill and every measured run
-      is prefix-cache hits + full decode — the prod steady state.
-    - Thread-safe counter for concurrent payload generation.
+    Each request is `system + one user message` where the user content is
+    `shared_prefix + "\\n" + tail_k`. `shared_prefix` is byte-identical for every
+    request (so it is a prefix-cache hit after the first request); `tail_k` is
+    unique per request index (so every request pays real prefill). Both are
+    deterministic, so repeated runs have identical shape.
+
+    Construction FAILS LOUDLY if the payload cannot be sized or would not fit the
+    model's context - a mis-sized benchmark must never be scored silently.
     """
 
-    def __init__(self, depths=(1, 2, 3, 4, 5), num_turns: int = NUM_TURNS, max_tokens: int = BENCHMARK_MAX_TOKENS):
-        self.depths = tuple(depths)
-        self.num_turns = num_turns
-        self.max_tokens = max_tokens
+    def __init__(self, prefix_tokens=BENCH_PREFIX_TOKENS, tail_tokens=BENCH_TAIL_TOKENS,
+                 max_tokens=BENCHMARK_MAX_TOKENS, max_model_len=BENCH_MAX_MODEL_LEN,
+                 prefix_seed=BENCH_PREFIX_SEED):
+        self.prefix_tokens = int(prefix_tokens)
+        self.tail_tokens = int(tail_tokens)
+        self.max_tokens = int(max_tokens)
+        self.max_model_len = int(max_model_len)
         self.system_message = (
             "You are an autonomous AI agent performing multi-step reasoning. "
             "Use the conversation history to execute the next step."
         )
-        self.user_chunks = [
-            f"Step {i + 1} context observations: {_seeded_chunk_chars(1000 + i, USER_CHUNK_CHARS)}"
-            for i in range(num_turns)
-        ]
-        self.assistant_acks = [
-            f"Step {i + 1} result: {_seeded_chunk_chars(2000 + i, ASSISTANT_ACK_CHARS)}"
-            for i in range(num_turns)
-        ]
+        self.shared_prefix = _seeded_text_for_tokens(prefix_seed, self.prefix_tokens)
+        self._tails = {}
         self._counter = 0
         self._lock = threading.Lock()
+
+        prompt_tokens = count_tokens(self.shared_prefix) + count_tokens(self.system_message)
+        drift = abs(prompt_tokens - self.prefix_tokens)
+        assert drift <= max(4, 0.02 * self.prefix_tokens), (
+            f"bench prefix sizing failed: {prompt_tokens:.0f} tok vs target "
+            f"{self.prefix_tokens}")
+        assert prompt_tokens + self.tail_tokens + self.max_tokens <= self.max_model_len, (
+            f"bench payload {prompt_tokens + self.tail_tokens:.0f} + {self.max_tokens} out "
+            f"exceeds max_model_len {self.max_model_len}")
+        self.prefix_hash = hashlib.sha256(self.shared_prefix.encode()).hexdigest()[:16]
+        has_tok = _tokenizer() is not None
+        print(f"bench: prefix={prompt_tokens:.0f} tok (sha256={self.prefix_hash}, "
+              f"exact_tokenizer={has_tok}), tail={self.tail_tokens} tok/request, "
+              f"out={self.max_tokens}, prompt_total="
+              f"{prompt_tokens + self.tail_tokens:.0f} tok", flush=True)
+
+    def _tail(self, idx: int) -> str:
+        tail = self._tails.get(idx)
+        if tail is None:
+            tail = _seeded_text_for_tokens(2000 + idx, self.tail_tokens)
+            self._tails[idx] = tail
+        return tail
 
     def __call__(self) -> dict:
         model = _resolve_model_name_or_raise()
         with self._lock:
-            depth = self.depths[self._counter % len(self.depths)]
+            idx = self._counter
             self._counter += 1
-        messages = [{"role": "system", "content": self.system_message}]
-        for i in range(depth):
-            messages.append(
-                {"role": "user", "content": f"Execute agentic step {i + 1}.\n{self.user_chunks[i]}"}
-            )
-            if i < depth - 1:
-                messages.append({"role": "assistant", "content": self.assistant_acks[i]})
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": [
+                {"role": "system", "content": self.system_message},
+                {"role": "user", "content": self.shared_prefix + "\n" + self._tail(idx)},
+            ],
             "temperature": 0.7,
             "max_tokens": self.max_tokens,
             "ignore_eos": True,
@@ -284,7 +324,7 @@ def run(defaults: EngineDefaults) -> None:
     alias = f" (BACKEND={backend})" if backend and backend != defaults.name else ""
     print(f"Using worker backend: {defaults.name}{alias}", flush=True)
 
-    agentic_workflow_generator = AgenticWorkflowGenerator(depths=BENCH_DEPTHS)
+    agentic_workflow_generator = AgenticWorkflowGenerator()
 
     # Relative path resolves against the server url+port; a full URL is used as-is.
     healthcheck_url = os.environ.get("MODEL_HEALTH_ENDPOINT", "/health")
