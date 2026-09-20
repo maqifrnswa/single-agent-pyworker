@@ -11,7 +11,7 @@ import urllib.request
 
 os.environ.setdefault("MODEL_NAME", "/models/qwen3.8-27b-awq-int4")
 
-from worker import AgenticWorkflowGenerator
+from worker import AgenticWorkflowGenerator, _prompt_text, count_tokens
 
 depth = int(os.environ.get("DEPTH", "10"))
 gen = AgenticWorkflowGenerator(depths=(depth,), max_tokens=512)
@@ -20,6 +20,7 @@ payload = gen()
 n_chars = sum(len(m.get("content", "")) for m in payload["messages"])
 print("num_messages:", len(payload["messages"]))
 print("total_chars:", n_chars, "est_tokens:", round(n_chars / 4))
+print("tokenizer_tokens:", int(count_tokens(_prompt_text(payload))))
 print("max_tokens:", payload["max_tokens"], "ignore_eos:", payload.get("ignore_eos"))
 print("keys:", sorted(payload.keys()))
 

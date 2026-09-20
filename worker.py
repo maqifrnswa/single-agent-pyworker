@@ -83,8 +83,40 @@ NUM_TURNS = 10
 BENCH_DEPTHS = (4, 4, 4)
 USER_CHUNK_CHARS = 38000
 ASSISTANT_ACK_CHARS = 2000
-BENCHMARK_MAX_TOKENS = 512 # this must be typical, average for workload
-AVERAGE_OUTPUT_TOKENS = BENCHMARK_MAX_TOKENS # this is the average output tokens for workload
+BENCHMARK_MAX_TOKENS = 512  # this must be typical, average for workload
+# Average output tokens charged per request. Measured on real opencode agentic
+# traffic (text+reasoning): mean ~471, median 166, p90 ~1457. Env-overridable.
+AVERAGE_OUTPUT_TOKENS = float(os.environ.get("WORKLOAD_AVG_OUTPUT_TOKENS",
+                                             str(BENCHMARK_MAX_TOKENS)))
+# Fraction of prompt tokens charged as uncached prefill. Real agentic traffic
+# measured ~86% prefix-cache hits (=> ~0.14 uncached); 0.25 is a conservative
+# upper bound. Env-overridable.
+WORKLOAD_UNCACHED_FRACTION = float(os.environ.get("WORKLOAD_UNCACHED_FRACTION", "0.25"))
+# Fallback chars-per-token when the tokenizer is unavailable (~4 natural text,
+# ~3.5 agentic code/JSON). Env-overridable.
+WORKLOAD_CHARS_PER_TOKEN = float(os.environ.get("WORKLOAD_CHARS_PER_TOKEN", "4.0"))
+
+# Optional tool-call shape for benchmark payloads. The benchmark only measures
+# throughput, so the model need not actually call tools - but a real tool schema
+# makes input token density match production. Off by default: a server without
+# tool support would 400. Enable with BENCH_TOOL_CALLS=1.
+BENCH_TOOL_CALLS = os.environ.get("BENCH_TOOL_CALLS", "0") == "1"
+BENCH_TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "shell",
+        "description": "Run a shell command in the workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "workdir": {"type": "string"},
+                "timeout": {"type": "integer"},
+            },
+            "required": ["command"],
+        },
+    },
+}]
 
 def _seeded_chunk_chars(seed: int, n_chars: int) -> str:
     """Deterministic diverse filler: same seed always yields the same string.
@@ -110,28 +142,80 @@ def request_parser(request):
     return request["input"] if request.get("input") is not None else request
 
 
-def chat_workload(data) -> float:
-    """Total input + output tokens (char/4 estimate), the Vast-recommended LLM cost proxy."""
+_TOKENIZER = None
+_TOKENIZER_TRIED = False
+
+
+def _tokenizer():
+    """Lazy model tokenizer from the served model dir; None if unavailable."""
+    global _TOKENIZER, _TOKENIZER_TRIED
+    if not _TOKENIZER_TRIED:
+        _TOKENIZER_TRIED = True
+        try:
+            from tokenizers import Tokenizer  # provided by requirements.txt
+            model_dir = _resolve_model_name_or_raise()
+            _TOKENIZER = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
+        except Exception as e:
+            print(f"workload: tokenizer unavailable ({type(e).__name__}: {e}); "
+                  f"falling back to {WORKLOAD_CHARS_PER_TOKEN} chars/token", flush=True)
+            _TOKENIZER = None
+    return _TOKENIZER
+
+
+def count_tokens(text: str) -> float:
+    """Exact token count when a tokenizer is available, else a char estimate."""
+    if not text:
+        return 0.0
+    tok = _tokenizer()
+    if tok is not None:
+        try:
+            return float(len(tok.encode(text, add_special_tokens=False).ids))
+        except Exception:
+            pass
+    return len(text) / WORKLOAD_CHARS_PER_TOKEN
+
+
+def _prompt_text(data) -> str:
+    """All input text from a chat or completions payload."""
+    parts = []
+    messages = data.get("messages", [])
+    if isinstance(messages, list):
+        for m in messages:
+            if isinstance(m, dict):
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            parts.append(part["text"])
+    prompt = data.get("prompt", "")
+    if isinstance(prompt, str):
+        parts.append(prompt)
+    return "\n".join(parts)
+
+
+def expected_output_tokens(data) -> float:
+    """Charged output tokens: the client cap only when it is BELOW the measured
+    average (a cap is an upper bound, never an expectation), else the average."""
+    mt = data.get("max_tokens")
+    if mt is None:
+        return AVERAGE_OUTPUT_TOKENS
     try:
-        total_chars = 0
-        messages = data.get("messages", [])
-        if isinstance(messages, list):
-            for m in messages:
-                if isinstance(m, dict):
-                    content = m.get("content", "")
-                    if isinstance(content, str):
-                        total_chars += len(content)
-                    elif isinstance(content, list):
-                        # OpenAI structured content parts: [{type, text}, ...]
-                        for part in content:
-                            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                                total_chars += len(part["text"])
-        # Fall back for /v1/completions-style payloads sharing this calculator.
-        prompt = data.get("prompt", "")
-        if isinstance(prompt, str):
-            total_chars += len(prompt)
-        #return float(data.get("max_tokens", 0) + 0.25*total_chars / 4.0) # chars/4 = token estimate, 0.75 for cache hit
-        return float(AVERAGE_OUTPUT_TOKENS + 0.25*total_chars / 4.0) # chars/4 = token estimate, 0.75 for cache hit; 500 output toks on average
+        return min(float(mt), AVERAGE_OUTPUT_TOKENS)
+    except (TypeError, ValueError):
+        return AVERAGE_OUTPUT_TOKENS
+
+
+def chat_workload(data) -> float:
+    """Charged workload = expected output + uncached_fraction * prompt tokens.
+
+    Uses the real model tokenizer when available (chars/token fallback), so dense
+    code/JSON/tool-schema prompts are not under-counted by a fixed chars/4.
+    Works for both chat and completions payloads."""
+    try:
+        return (expected_output_tokens(data)
+                + WORKLOAD_UNCACHED_FRACTION * count_tokens(_prompt_text(data)))
     except Exception:
         return float(data.get("max_tokens", 0))
 
@@ -179,13 +263,17 @@ class AgenticWorkflowGenerator:
             )
             if i < depth - 1:
                 messages.append({"role": "assistant", "content": self.assistant_acks[i]})
-        return {
+        payload = {
             "model": model,
             "messages": messages,
             "temperature": 0.7,
             "max_tokens": self.max_tokens,
             "ignore_eos": True,
         }
+        if BENCH_TOOL_CALLS:
+            payload["tools"] = BENCH_TOOLS
+            payload["tool_choice"] = "auto"
+        return payload
 
 
 def run(defaults: EngineDefaults) -> None:
@@ -209,7 +297,7 @@ def run(defaults: EngineDefaults) -> None:
         handlers=[
             HandlerConfig(
                 route="/v1/completions",
-                workload_calculator=lambda data: float(data.get("max_tokens", 0)),
+                workload_calculator=chat_workload,   # charges input too (was max_tokens-only)
                 allow_parallel_requests=True,
                 request_parser=request_parser,
                 max_queue_time=600.0
