@@ -345,6 +345,12 @@ def run(defaults: EngineDefaults) -> None:
     # Relative path resolves against the server url+port; a full URL is used as-is.
     healthcheck_url = os.environ.get("MODEL_HEALTH_ENDPOINT", "/health")
 
+    # Production-shaped benchmark payload generator (shared cached prefix +
+    # unique fresh tail). Constructed ONCE; referenced by the chat handler's
+    # BenchmarkConfig below. (NameError at run() time if this line is missing
+    # -- test_sdk_contract.py catches that; py_compile cannot.)
+    agentic_workflow_generator = AgenticWorkflowGenerator()
+
     config = dict(
         model_server_url=MODEL_SERVER_URL,
         model_server_port=MODEL_SERVER_PORT,
