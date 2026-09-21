@@ -480,21 +480,38 @@ def _run_benchmark_background():
           f"spread(IQR/median)={spread:.3f}, cache_ok={cache_ok_runs}/{N_RUNS}",
           flush=True)
 
+    # Verification gates WARN but do NOT block the write. The engine has no
+    # good fallback when .has_benchmark is absent -- the dlperf fallback uses
+    # a different unit (machine-class) per machine, so a mixed fleet has
+    # mixed units and damages the autoscaler. Best-effort write keeps the
+    # stamp in workload units; the WARNING flags it for operator review.
+    unverified_reason = None
     if cache_ok_runs < 3:
-        print(f"bench_bg: CACHE FAILED ({cache_ok_runs}/5 runs hit >=80%); "
-              f".has_benchmark NOT written", flush=True)
-        return
-    if spread > SPREAD_LIMIT:
-        print(f"bench_bg: SPREAD HIGH (IQR/median = {spread:.3f} > "
-              f"{SPREAD_LIMIT:.2f}); .has_benchmark NOT written", flush=True)
-        return
+        unverified_reason = (
+            f"cache verification failed ({cache_ok_runs}/{N_RUNS} runs "
+            f"hit >= {int(CACHE_HIT_FRAC*100)}% of prefix)"
+        )
+    elif spread > SPREAD_LIMIT:
+        unverified_reason = (
+            f"spread too high (IQR/median={spread:.3f} > {SPREAD_LIMIT:.2f})"
+        )
 
-    # Verification passed: we own .has_benchmark.
+    # We own .has_benchmark. Write the median regardless; surface the warning.
     stamp_path = os.path.join(os.getcwd(), ".has_benchmark")
     try:
         with open(stamp_path, "w") as f:
             f.write(str(median_perf))
-        print(f"bench_bg: WROTE .has_benchmark = {median_perf}", flush=True)
+        if unverified_reason:
+            print(
+                f"bench_bg: WARNING WROTE UNVERIFIED .has_benchmark = "
+                f"{median_perf:.1f} units/s (reason: {unverified_reason}). "
+                f"Engine gets a workload-unit stamp (no dlperf fallback); "
+                f"value may be inaccurate. Investigate cache warming or "
+                f"host load before trusting perf/$ decisions.",
+                flush=True,
+            )
+        else:
+            print(f"bench_bg: WROTE .has_benchmark = {median_perf:.1f}", flush=True)
     except Exception as e:
         print(f"bench_bg: failed to write .has_benchmark: {type(e).__name__}: {e}",
               flush=True)
