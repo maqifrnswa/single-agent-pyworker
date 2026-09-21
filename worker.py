@@ -13,7 +13,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import List
 
-from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig
+from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
 
 # Import the shared workload model (pure Python, stdlib-only).
 # workload_model.py lives alongside worker.py in this repo. Worker is launched
@@ -364,6 +364,20 @@ def run(defaults: EngineDefaults) -> None:
                 allow_parallel_requests=True,
                 request_parser=request_parser,
                 max_queue_time=600.0,
+                # BenchmarkConfig is REQUIRED by the SDK (server/worker.py:380
+                # raises "Missing EndpointHandler with BenchmarkConfig" if no
+                # handler has one). We attach ours to chat so the workload_calculator
+                # (3-component formula) and the benchmark charge are in matching
+                # units -- otherwise queue_time = cur_load / perf is dimensionally
+                # wrong. Same AgenticWorkflowGenerator as before: production-shaped
+                # (cached prefix + fresh tail), token-sized, ignore_eos for
+                # forced full decode. runs=2 per the assessment: measured runs
+                # are all warm, so runs=2 is stable. The SDK reports max-of-runs.
+                benchmark_config=BenchmarkConfig(
+                    generator=agentic_workflow_generator,
+                    concurrency=2,
+                    runs=2,
+                ),
             ),
         ],
         log_action_config=LogActionConfig(
@@ -372,150 +386,7 @@ def run(defaults: EngineDefaults) -> None:
             on_info=_env_lines("MODEL_INFO_LOG_MSGS", defaults.info_log_msgs),
         ),
     )
-    # Run our own benchmark in a background thread (no SDK BenchmarkConfig on
-    # the chat handler; lib-1: raising inside the SDK's generator bricks the
-    # worker with backend_errored). We call vLLM directly, verify cache state,
-    # and own .has_benchmark. Daemon=True: dies with the main process.
-    threading.Thread(target=_run_benchmark_background, daemon=True,
-                     name="bench-bg").start()
     Worker(WorkerConfig(**config)).run()
-
-
-def _run_benchmark_background():
-    """Background benchmark loop. Runs after model-load; calls vLLM directly
-    via http://127.0.0.1:18000; verifies cache state; writes .has_benchmark
-    if verified. No SDK BenchmarkConfig involvement (lib-1: raising inside
-    generator bricks the worker with backend_errored)."""
-    import json as _json
-    import statistics as _stats
-    import time as _time
-    import urllib.request
-    from concurrent.futures import ThreadPoolExecutor
-
-    BASE = f"http://127.0.0.1:{MODEL_SERVER_PORT}/v1"
-    HEALTH = f"http://127.0.0.1:{MODEL_SERVER_PORT}/health"
-
-    # Wait for vLLM to be ready (poll /health).
-    print("bench_bg: waiting for vLLM readiness...", flush=True)
-    ready = False
-    for _ in range(180):  # 180 * 5s = 15min max
-        try:
-            with urllib.request.urlopen(HEALTH, timeout=2) as r:
-                if r.status == 200:
-                    ready = True
-                    break
-        except Exception:
-            pass
-        _time.sleep(5)
-    if not ready:
-        print("bench_bg: vLLM never became ready; skipping benchmark", flush=True)
-        return
-
-    gen = AgenticWorkflowGenerator()
-    N_RUNS = 5
-    CONC = 4
-    CACHE_HIT_FRAC = 0.80
-    SPREAD_LIMIT = 0.20
-
-    def _send(payload):
-        """One non-streaming /v1/chat/completions request against vLLM.
-
-        Returns (elapsed_seconds, charge, cached_tokens) or None on failure.
-        Charge comes from the SAME chat_workload() the SDK uses, so charge and
-        measurement agree.
-        """
-        body = dict(payload)
-        body["stream"] = False
-        data = _json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            BASE + "/chat/completions",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        t0 = _time.monotonic()
-        try:
-            with urllib.request.urlopen(req, timeout=600) as r:
-                resp = _json.loads(r.read().decode("utf-8", errors="replace"))
-            t1 = _time.monotonic()
-        except Exception as e:
-            print(f"bench_bg: request failed: {type(e).__name__}: {e}", flush=True)
-            return None
-        usage = resp.get("usage") or {}
-        details = usage.get("prompt_tokens_details") or {}
-        cached = int(details.get("cached_tokens", 0) or 0)
-        return (t1 - t0, chat_workload(body), cached)
-
-    perfs = []
-    cached_runs = []
-    for run_idx in range(N_RUNS):
-        t0 = _time.monotonic()
-        with ThreadPoolExecutor(max_workers=CONC) as pool:
-            futures = [pool.submit(_send, gen()) for _ in range(CONC)]
-            results = [f.result() for f in futures]
-        wall = _time.monotonic() - t0
-
-        ok = [r for r in results if r is not None]
-        total_charge = sum(r[1] for r in ok)
-        best_cached = max((r[2] for r in ok), default=0)
-        if ok:
-            perfs.append(total_charge / max(wall, 1e-9))
-            cached_runs.append(best_cached)
-        print(f"bench_bg: run {run_idx+1}/{N_RUNS}: {len(ok)}/{CONC} ok, "
-              f"wall={wall:.2f}s, cached_tokens={best_cached}", flush=True)
-
-    if len(perfs) < 1:
-        print("bench_bg: no successful runs; benchmark skipped", flush=True)
-        return
-
-    median_perf = _stats.median(perfs)
-    if len(perfs) >= 4:
-        qs = _stats.quantiles(perfs, n=4)
-        spread = (qs[2] - qs[0]) / median_perf if median_perf > 0 else 1.0
-    else:
-        spread = float("inf")
-    cache_ok_runs = sum(
-        1 for c in cached_runs if c >= CACHE_HIT_FRAC * gen.prefix_tokens)
-
-    print(f"bench_bg: median_perf={median_perf:.1f} units/s, "
-          f"spread(IQR/median)={spread:.3f}, cache_ok={cache_ok_runs}/{N_RUNS}",
-          flush=True)
-
-    # Verification gates WARN but do NOT block the write. The engine has no
-    # good fallback when .has_benchmark is absent -- the dlperf fallback uses
-    # a different unit (machine-class) per machine, so a mixed fleet has
-    # mixed units and damages the autoscaler. Best-effort write keeps the
-    # stamp in workload units; the WARNING flags it for operator review.
-    unverified_reason = None
-    if cache_ok_runs < 3:
-        unverified_reason = (
-            f"cache verification failed ({cache_ok_runs}/{N_RUNS} runs "
-            f"hit >= {int(CACHE_HIT_FRAC*100)}% of prefix)"
-        )
-    elif spread > SPREAD_LIMIT:
-        unverified_reason = (
-            f"spread too high (IQR/median={spread:.3f} > {SPREAD_LIMIT:.2f})"
-        )
-
-    # We own .has_benchmark. Write the median regardless; surface the warning.
-    stamp_path = os.path.join(os.getcwd(), ".has_benchmark")
-    try:
-        with open(stamp_path, "w") as f:
-            f.write(str(median_perf))
-        if unverified_reason:
-            print(
-                f"bench_bg: WARNING WROTE UNVERIFIED .has_benchmark = "
-                f"{median_perf:.1f} units/s (reason: {unverified_reason}). "
-                f"Engine gets a workload-unit stamp (no dlperf fallback); "
-                f"value may be inaccurate. Investigate cache warming or "
-                f"host load before trusting perf/$ decisions.",
-                flush=True,
-            )
-        else:
-            print(f"bench_bg: WROTE .has_benchmark = {median_perf:.1f}", flush=True)
-    except Exception as e:
-        print(f"bench_bg: failed to write .has_benchmark: {type(e).__name__}: {e}",
-              flush=True)
-
 
 if __name__ == "__main__":
     # run it
