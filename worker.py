@@ -13,7 +13,24 @@ import threading
 from dataclasses import dataclass, field
 from typing import List
 
-from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig, BenchmarkConfig
+from vastai import Worker, WorkerConfig, HandlerConfig, LogActionConfig
+
+# Import the shared workload model (pure Python, stdlib-only).
+# workload_model.py lives alongside worker.py in this repo. Worker is launched
+# with the repo root as cwd, so a direct import resolves. The harness-side
+# copy at vast_ai_controller/serverless_load/workload_model.py is kept in
+# sync manually (they MUST stay identical -- both compute the same charge).
+try:
+    from workload_model import (
+        charge_workload as _wm_charge_workload,
+        count_tokens as _wm_count_tokens,
+        set_tokenizer as _wm_set_tokenizer,
+        DEFAULT_HIT_RATE as _wm_DEFAULT_HIT_RATE,
+    )
+    _WORKLOAD_MODEL_AVAILABLE = True
+except ImportError as e:
+    print(f"workload: workload_model not available ({e}); using legacy formula", flush=True)
+    _WORKLOAD_MODEL_AVAILABLE = False
 
 
 def _env_lines(name, default):
@@ -60,27 +77,21 @@ MODEL_SERVER_PORT = 18000
 # observed on different workers). That timeout is server-side (vast-ai
 # autoscaler, types.cpp) — there is no timeout constant anywhere in the
 # pyworker SDK and no workergroup knob for it.
-# BENCHMARK DESIGN (steady-state, not curve slice): every measured request is a
-# byte-identical shared prefix (a prefix-cache hit after the SDK's single
-# unmeasured warmup) plus a unique fresh tail (real prefill), and a forced full
-# decode (ignore_eos). The shape is IDENTICAL for every request and every run,
-# so the SDK's max-over-runs cannot select a warmer/faster/unrepresentative run.
-# Payloads are sized in REAL TOKENS via count_tokens(), and the benchmark's
-# forced decode length equals the calculator's charged output term, so charge
-# and measurement agree. runs=2 is safe because no measured run is cold.
+# BENCHMARK DESIGN (steadystate): every measured request is a byte-identical
+# shared prefix (a prefix-cache hit) plus a unique fresh tail (real prefill),
+# and a forced full decode (ignore_eos). The shape is IDENTICAL for every
+# request and every run. Payloads are sized in REAL TOKENS via count_tokens(),
+# and the forced decode length equals the calculator's charged output term, so
+# charge and measurement agree.
 # TOKEN DENSITY NOTE: the seeded filler (random lower/digit words) tokenizes at
 # ~1.5 chars/token, not the ~4 of natural text; sizing goes through
 # count_tokens(), so this only affects byte length, not the token geometry.
 # Slow hosts (~250 tok/s effective prefill) may still time out warming the
-# prefix inside the loading window; they cannot serve this workload, so failing
-# loudly beats a misleading score.
+# prefix; they cannot serve this workload, so failing loudly beats a
+# misleading score.
 # Average output tokens charged per request. Measured on real opencode agentic
 # traffic (text+reasoning): mean ~471, median 166, p90 ~1457. Env-overridable.
 AVERAGE_OUTPUT_TOKENS = float(os.environ.get("WORKLOAD_AVG_OUTPUT_TOKENS", "512"))
-# Fraction of prompt tokens charged as uncached prefill. Real agentic traffic
-# measured ~86% prefix-cache hits (=> ~0.14 uncached); 0.25 is a conservative
-# upper bound. Env-overridable.
-WORKLOAD_UNCACHED_FRACTION = float(os.environ.get("WORKLOAD_UNCACHED_FRACTION", "0.25"))
 # Fallback chars-per-token when the tokenizer is unavailable (~4 natural text,
 # ~3.5 agentic code/JSON). Env-overridable.
 WORKLOAD_CHARS_PER_TOKEN = float(os.environ.get("WORKLOAD_CHARS_PER_TOKEN", "4.0"))
@@ -88,7 +99,7 @@ WORKLOAD_CHARS_PER_TOKEN = float(os.environ.get("WORKLOAD_CHARS_PER_TOKEN", "4.0
 # Benchmark geometry, in REAL TOKENS (production-shaped). Every measured request
 # is: byte-identical shared prefix (a prefix-cache hit) + a unique fresh tail
 # (real prefill), plus a forced full decode. Shape is identical for every
-# request and run, so max-over-runs cannot pick a warmer/faster run.
+# request and run.
 BENCH_PREFIX_TOKENS = int(os.environ.get("BENCH_PREFIX_TOKENS", "61060"))  # shared, cached
 BENCH_TAIL_TOKENS = int(os.environ.get("BENCH_TAIL_TOKENS", "9940"))       # fresh, unique per request
 BENCH_MAX_MODEL_LEN = int(os.environ.get("BENCH_MAX_MODEL_LEN", "262144"))
@@ -183,6 +194,11 @@ def _tokenizer():
             print(f"workload: tokenizer unavailable ({type(e).__name__}: {e}); "
                   f"falling back to {WORKLOAD_CHARS_PER_TOKEN} chars/token", flush=True)
             _TOKENIZER = None
+        # Wire up the tokenizer for the shared workload model.
+        if _TOKENIZER is not None and _WORKLOAD_MODEL_AVAILABLE:
+            def _tok_fn(text):
+                return len(_TOKENIZER.encode(text, add_special_tokens=False).ids)
+            _wm_set_tokenizer(_tok_fn)
     return _TOKENIZER
 
 
@@ -219,28 +235,23 @@ def _prompt_text(data) -> str:
     return "\n".join(parts)
 
 
-def expected_output_tokens(data) -> float:
-    """Charged output tokens: the client cap only when it is BELOW the measured
-    average (a cap is an upper bound, never an expectation), else the average."""
-    mt = data.get("max_tokens")
-    if mt is None:
-        return AVERAGE_OUTPUT_TOKENS
-    try:
-        return min(float(mt), AVERAGE_OUTPUT_TOKENS)
-    except (TypeError, ValueError):
-        return AVERAGE_OUTPUT_TOKENS
-
-
 def chat_workload(data) -> float:
-    """Charged workload = expected output + uncached_fraction * prompt tokens.
+    """Charged workload using the three-component formula with fixed hit_rate.
 
-    Uses the real model tokenizer when available (chars/token fallback), so dense
-    code/JSON/tool-schema prompts are not under-counted by a fixed chars/4.
-    Works for both chat and completions payloads."""
+    Formula:
+      work = expected_output_tokens
+           + W_PREFILL * prompt_tokens * (1 - hit_rate)
+           + W_CACHED  * prompt_tokens * hit_rate
+
+    hit_rate is the fixed DEFAULT_HIT_RATE (0.86 measured steady-state cache
+    hit rate; no EWMA tracking in this redesign). The charge is computed by the
+    shared workload_model so the SDK charge and the background benchmark agree.
+    """
     try:
-        return (expected_output_tokens(data)
-                + WORKLOAD_UNCACHED_FRACTION * count_tokens(_prompt_text(data)))
+        prompt_tokens = _wm_count_tokens(_prompt_text(data))
+        return _wm_charge_workload(data, prompt_tokens=prompt_tokens, hit_rate=_wm_DEFAULT_HIT_RATE)
     except Exception:
+        # Fallback to SDK's default if workload_model is unavailable or charge fails.
         return float(data.get("max_tokens", 0))
 
 
@@ -296,10 +307,17 @@ class AgenticWorkflowGenerator:
         return tail
 
     def __call__(self) -> dict:
+        """Generate a benchmark payload (shared prefix + unique fresh tail).
+
+        Cache verification is NOT enforced here (lib-1: raising inside the SDK's
+        benchmark generator bricks the worker with backend_errored). The
+        background benchmark loop verifies cache on the responses instead.
+        """
         model = _resolve_model_name_or_raise()
         with self._lock:
             idx = self._counter
             self._counter += 1
+
         payload = {
             "model": model,
             "messages": [
@@ -324,8 +342,6 @@ def run(defaults: EngineDefaults) -> None:
     alias = f" (BACKEND={backend})" if backend and backend != defaults.name else ""
     print(f"Using worker backend: {defaults.name}{alias}", flush=True)
 
-    agentic_workflow_generator = AgenticWorkflowGenerator()
-
     # Relative path resolves against the server url+port; a full URL is used as-is.
     healthcheck_url = os.environ.get("MODEL_HEALTH_ENDPOINT", "/health")
 
@@ -348,9 +364,6 @@ def run(defaults: EngineDefaults) -> None:
                 allow_parallel_requests=True,
                 request_parser=request_parser,
                 max_queue_time=600.0,
-                benchmark_config=BenchmarkConfig(
-                                    generator=agentic_workflow_generator, concurrency=2, runs=2
-                                ),
             ),
         ],
         log_action_config=LogActionConfig(
@@ -359,7 +372,132 @@ def run(defaults: EngineDefaults) -> None:
             on_info=_env_lines("MODEL_INFO_LOG_MSGS", defaults.info_log_msgs),
         ),
     )
+    # Run our own benchmark in a background thread (no SDK BenchmarkConfig on
+    # the chat handler; lib-1: raising inside the SDK's generator bricks the
+    # worker with backend_errored). We call vLLM directly, verify cache state,
+    # and own .has_benchmark. Daemon=True: dies with the main process.
+    threading.Thread(target=_run_benchmark_background, daemon=True,
+                     name="bench-bg").start()
     Worker(WorkerConfig(**config)).run()
+
+
+def _run_benchmark_background():
+    """Background benchmark loop. Runs after model-load; calls vLLM directly
+    via http://127.0.0.1:18000; verifies cache state; writes .has_benchmark
+    if verified. No SDK BenchmarkConfig involvement (lib-1: raising inside
+    generator bricks the worker with backend_errored)."""
+    import json as _json
+    import statistics as _stats
+    import time as _time
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+
+    BASE = f"http://127.0.0.1:{MODEL_SERVER_PORT}/v1"
+    HEALTH = f"http://127.0.0.1:{MODEL_SERVER_PORT}/health"
+
+    # Wait for vLLM to be ready (poll /health).
+    print("bench_bg: waiting for vLLM readiness...", flush=True)
+    ready = False
+    for _ in range(180):  # 180 * 5s = 15min max
+        try:
+            with urllib.request.urlopen(HEALTH, timeout=2) as r:
+                if r.status == 200:
+                    ready = True
+                    break
+        except Exception:
+            pass
+        _time.sleep(5)
+    if not ready:
+        print("bench_bg: vLLM never became ready; skipping benchmark", flush=True)
+        return
+
+    gen = AgenticWorkflowGenerator()
+    N_RUNS = 5
+    CONC = 4
+    CACHE_HIT_FRAC = 0.80
+    SPREAD_LIMIT = 0.20
+
+    def _send(payload):
+        """One non-streaming /v1/chat/completions request against vLLM.
+
+        Returns (elapsed_seconds, charge, cached_tokens) or None on failure.
+        Charge comes from the SAME chat_workload() the SDK uses, so charge and
+        measurement agree.
+        """
+        body = dict(payload)
+        body["stream"] = False
+        data = _json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            BASE + "/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        t0 = _time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                resp = _json.loads(r.read().decode("utf-8", errors="replace"))
+            t1 = _time.monotonic()
+        except Exception as e:
+            print(f"bench_bg: request failed: {type(e).__name__}: {e}", flush=True)
+            return None
+        usage = resp.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens", 0) or 0)
+        return (t1 - t0, chat_workload(body), cached)
+
+    perfs = []
+    cached_runs = []
+    for run_idx in range(N_RUNS):
+        t0 = _time.monotonic()
+        with ThreadPoolExecutor(max_workers=CONC) as pool:
+            futures = [pool.submit(_send, gen()) for _ in range(CONC)]
+            results = [f.result() for f in futures]
+        wall = _time.monotonic() - t0
+
+        ok = [r for r in results if r is not None]
+        total_charge = sum(r[1] for r in ok)
+        best_cached = max((r[2] for r in ok), default=0)
+        if ok:
+            perfs.append(total_charge / max(wall, 1e-9))
+            cached_runs.append(best_cached)
+        print(f"bench_bg: run {run_idx+1}/{N_RUNS}: {len(ok)}/{CONC} ok, "
+              f"wall={wall:.2f}s, cached_tokens={best_cached}", flush=True)
+
+    if len(perfs) < 1:
+        print("bench_bg: no successful runs; benchmark skipped", flush=True)
+        return
+
+    median_perf = _stats.median(perfs)
+    if len(perfs) >= 4:
+        qs = _stats.quantiles(perfs, n=4)
+        spread = (qs[2] - qs[0]) / median_perf if median_perf > 0 else 1.0
+    else:
+        spread = float("inf")
+    cache_ok_runs = sum(
+        1 for c in cached_runs if c >= CACHE_HIT_FRAC * gen.prefix_tokens)
+
+    print(f"bench_bg: median_perf={median_perf:.1f} units/s, "
+          f"spread(IQR/median)={spread:.3f}, cache_ok={cache_ok_runs}/{N_RUNS}",
+          flush=True)
+
+    if cache_ok_runs < 3:
+        print(f"bench_bg: CACHE FAILED ({cache_ok_runs}/5 runs hit >=80%); "
+              f".has_benchmark NOT written", flush=True)
+        return
+    if spread > SPREAD_LIMIT:
+        print(f"bench_bg: SPREAD HIGH (IQR/median = {spread:.3f} > "
+              f"{SPREAD_LIMIT:.2f}); .has_benchmark NOT written", flush=True)
+        return
+
+    # Verification passed: we own .has_benchmark.
+    stamp_path = os.path.join(os.getcwd(), ".has_benchmark")
+    try:
+        with open(stamp_path, "w") as f:
+            f.write(str(median_perf))
+        print(f"bench_bg: WROTE .has_benchmark = {median_perf}", flush=True)
+    except Exception as e:
+        print(f"bench_bg: failed to write .has_benchmark: {type(e).__name__}: {e}",
+              flush=True)
 
 
 if __name__ == "__main__":
