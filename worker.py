@@ -386,7 +386,156 @@ def run(defaults: EngineDefaults) -> None:
             on_info=_env_lines("MODEL_INFO_LOG_MSGS", defaults.info_log_msgs),
         ),
     )
+    # Background verifier: send N cache-verified runs directly to vLLM
+    # after the SDK has had a chance to write its .has_benchmark.
+    # Overwrite with the median stamp if the cache check passes --
+    # eliminates the max-of-N pathology (e.g. 431/689/897) on the NEXT
+    # warm boot. The current boot's engine-side stamp is whatever the
+    # SDK reported (we cannot intercept report_benchmark), but every
+    # subsequent restart picks up the verified median.
+    threading.Thread(target=_bench_warm_boot_verifier, daemon=True,
+                     name="bench-wb-verifier").start()
     Worker(WorkerConfig(**config)).run()
+
+
+def _bench_warm_boot_verifier():
+    """Cache-verified median stamp overwrites the SDK's max-of-N .has_benchmark
+    for the NEXT warm boot.
+
+    Sequence:
+      1. Wait for vLLM /health (up to 15 min).
+      2. Sleep long enough for the SDK's benchmark to finish and write its
+         .has_benchmark (empirically ~30-90s after model-load; we wait 90s).
+      3. Send 5x2 non-streaming /v1/chat/completions requests directly to vLLM
+         using the same AgenticWorkflowGenerator as the SDK's BenchmarkConfig.
+      4. For each run, record wall-clock, charge (via chat_workload, same as
+         the SDK uses, so units match), and cached_tokens (from
+         usage.prompt_tokens_details).
+      5. Compute median perf, IQR/median spread, and cache_ok count.
+      6. If cache_ok >= 3 AND spread <= 0.25: overwrite .has_benchmark with
+         the verified median. Otherwise log WARNING and leave SDK's stamp.
+
+    Constraints:
+      - Does NOT raise (would brick worker per lib-1; all failures logged).
+      - Writes to the SAME path the SDK writes to: .has_benchmark in CWD.
+      - Reads usage.prompt_tokens_details.cached_tokens from non-streaming
+        responses (no SSE buffering needed).
+    """
+    import json as _json
+    import statistics as _stats
+    import time as _time
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+
+    BASE = f"http://127.0.0.1:{MODEL_SERVER_PORT}/v1"
+    HEALTH = f"http://127.0.0.1:{MODEL_SERVER_PORT}/health"
+
+    print("bench_wb: waiting for vLLM readiness...", flush=True)
+    for _ in range(180):  # 180 * 5s = 15min max
+        try:
+            with urllib.request.urlopen(HEALTH, timeout=2) as r:
+                if r.status == 200:
+                    break
+        except Exception:
+            pass
+        _time.sleep(5)
+    else:
+        print("bench_wb: vLLM never became ready; skipping verifier", flush=True)
+        return
+
+    # Give the SDK's benchmark a head start. The SDK triggers on the model-
+    # load log message (~10-20s after /health) and then runs warmup + N
+    # measured runs of CONC requests each. Total ~30-90s. We wait 90s to be
+    # safe; this thread is best-effort.
+    print("bench_wb: waiting 90s for SDK benchmark to finish...", flush=True)
+    _time.sleep(90)
+
+    N_RUNS = 5
+    CONC = 2
+    CACHE_HIT_FRAC = 0.80
+    SPREAD_LIMIT = 0.25
+
+    def _send(payload):
+        body = dict(payload); body["stream"] = False
+        data = _json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            BASE + "/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        t0 = _time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                resp = _json.loads(r.read().decode("utf-8", errors="replace"))
+        except Exception as e:
+            print(f"bench_wb: send failed: {type(e).__name__}: {e}", flush=True)
+            return None
+        usage = resp.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens", 0) or 0)
+        return (_time.monotonic() - t0, chat_workload(body), cached)
+
+    gen = AgenticWorkflowGenerator()
+    perfs = []
+    cached_runs = []
+    for run_idx in range(N_RUNS):
+        t0 = _time.monotonic()
+        with ThreadPoolExecutor(max_workers=CONC) as pool:
+            results = [f.result() for f in
+                       [pool.submit(_send, gen()) for _ in range(CONC)]]
+        wall = _time.monotonic() - t0
+        ok = [r for r in results if r is not None]
+        if ok:
+            total_charge = sum(r[1] for r in ok)
+            best_cached = max(r[2] for r in ok)
+            perfs.append(total_charge / max(wall, 1e-9))
+            cached_runs.append(best_cached)
+        else:
+            best_cached = 0
+        print(f"bench_wb: run {run_idx+1}/{N_RUNS}: {len(ok)}/{CONC} ok, "
+              f"wall={wall:.2f}s, cached={best_cached}", flush=True)
+
+    if len(perfs) < 3:
+        print(f"bench_wb: only {len(perfs)}/{N_RUNS} valid runs; "
+              f"skipping overwrite", flush=True)
+        return
+
+    median_perf = _stats.median(perfs)
+    if len(perfs) >= 4:
+        qs = _stats.quantiles(perfs, n=4)
+        spread = (qs[2] - qs[0]) / median_perf if median_perf > 0 else 1.0
+    else:
+        spread = 1.0  # too few for IQR; treat as high
+    cache_ok = sum(1 for c in cached_runs
+                   if c >= CACHE_HIT_FRAC * gen.prefix_tokens)
+
+    print(f"bench_wb: median={median_perf:.1f} units/s "
+          f"spread(IQR/median)={spread:.3f} cache_ok={cache_ok}/{N_RUNS}",
+          flush=True)
+
+    if cache_ok < 3:
+        print(f"bench_wb: WARNING cache verification failed "
+              f"({cache_ok}/{N_RUNS} runs hit >={int(CACHE_HIT_FRAC*100)}%); "
+              f"leaving SDK .has_benchmark unchanged", flush=True)
+        return
+    if spread > SPREAD_LIMIT:
+        print(f"bench_wb: WARNING spread too high ({spread:.3f} > "
+              f"{SPREAD_LIMIT}); leaving SDK .has_benchmark unchanged",
+              flush=True)
+        return
+
+    # Verified. Overwrite .has_benchmark for the next warm boot.
+    stamp_path = os.path.join(os.getcwd(), ".has_benchmark")
+    try:
+        with open(stamp_path, "w") as f:
+            f.write(str(median_perf))
+        print(f"bench_wb: OVERWROTE .has_benchmark = {median_perf:.1f} "
+              f"(median of {N_RUNS}x{CONC} cache-verified runs; supersedes "
+              f"SDK's max-of-N for next warm boot)", flush=True)
+    except Exception as e:
+        print(f"bench_wb: overwrite failed: {type(e).__name__}: {e}",
+              flush=True)
+
 
 if __name__ == "__main__":
     # run it
